@@ -1,4 +1,5 @@
 import asyncio
+import os
 import threading
 import time
 import serial
@@ -15,7 +16,6 @@ class Microbit:
     def __init__(self, mode: str = "BOTH", dev_mode: bool = False):
         self.dev_mode = dev_mode
         print(f"--- 2025 micro:bit Hybrid Controller (Mode: {mode}) ---")
-        
         self.mode = mode.upper()
         self.current_mode = None
         self.ser: Optional[serial.Serial] = None
@@ -128,6 +128,20 @@ class Microbit:
             print(f"\n[MICROBIT]: {msg}\n> ", end="")
 
     def _start_serial_listener(self):
+        def __init__(self, mode: str = "BOTH", dev_mode: bool = False):
+            self.dev_mode = dev_mode
+            print(f"--- 2025 micro:bit Hybrid Controller (Mode: {mode}) ---")
+            self.mode = mode.upper()
+            self.current_mode = None
+            self.ser: Optional[serial.Serial] = None
+            self.ble_client: Optional[BleakClient] = None
+            self.active_rx = RX_UUID 
+            self.loop = asyncio.new_event_loop()
+            threading.Thread(target=self._run_loop, daemon=True).start()
+            self.reconnect()
+            
+            # Check for firmware updates
+            os.system("python update_checker.py")
         def listen():
             while self.ser and self.ser.is_open:
                 try:
@@ -176,48 +190,14 @@ class Microbit:
     def reset(self): self.send("reset")
     def ping(self): self.send("ping")
 
-class Arduino:
-    def __init__(self, baudrate: int = 115200, dev_mode: bool = False):
-        self.dev_mode = dev_mode
-        self.ser: Optional[serial.Serial] = None
-        print(f"--- 2025 Arduino USB Controller ---")
-        port = None
-        for p in serial.tools.list_ports.comports():
-            if "Arduino" in p.description or "USB Serial" in p.description:
-                port = p.device
-                break
-        if port is None:
-            print("Arduino not found. Check USB cable.")
-            return 
-        self.ser = serial.Serial(port, baudrate, timeout=1)
-        time.sleep(2)  # Wait for Arduino to reboot
-        self._dev_log(f"Connected to Arduino on {port} at {baudrate} baud.")
-
-    def _dev_log(self, msg: str):
-        if self.dev_mode: print(f"[DEV] {msg}")
-
-    def send(self, cmd: str):
-        message = (cmd.strip() + "\n").encode()
-        self.ser.write(message) #type: ignore
-        self._dev_log(f"Sent: {cmd.strip()}")
-        self.read_response()
-
-    def read_response(self) -> str:
-        response = self.ser.readline().decode().strip() #type: ignore
-        print(f"[ARDUINO]: {response}")
-        return response
-
-    def close(self):
-        self.ser.close() #type: ignore
-        self._dev_log("Serial connection closed.")
 
 if __name__ == "__main__":
     # Example usage of Arduino class
-    board = Arduino(dev_mode=True,baudrate=9600)
+    board = Microbit(dev_mode=True)
     if board.ser:
         try:
             while True:
-                command = input("Enter command to send to Arduino: ")
+                command = input("Enter command to send to Microbit: ")
                 board.send(command)
         except KeyboardInterrupt:
             print("Exiting...")
