@@ -1,248 +1,188 @@
-__version__ = "0.1.0"
+__version__ = "0.1.4"
+import os, sys, time, tempfile, shutil, subprocess, string, requests
 
-import re
-import time
-import requests
-import serial
-import serial.tools.list_ports
-import os
-import shutil
-import string
-import sys
-import tempfile
-
-# Only check the online firmware TS file
+# GitHub URLs
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/microbit_firmware.ts"
+GITHUB_PY_URL = "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/microbit_firmware.py"
 
-def parse_version_from_text(text):
-    m = re.search(r'__version__\s*=\s*[\'"]([^\'"]+)[\'"]', text)
-    return m.group(1).strip() if m else None
-
-def parse_version_from_ts(text):
-    """Extract version from TypeScript firmware file lines like '//  Version 2026.01.1'."""
-    m = re.search(r'Version\s*([0-9A-Za-z\.\-]+)', text, re.IGNORECASE)
-    return m.group(1).strip() if m else None
-
-def find_local_firmware_ts():
-    """Return path to microbit_firmware.ts in the same folder as this script (if present)."""
-    base = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.join(base, "microbit_firmware.ts")
-    return candidate if os.path.isfile(candidate) else None
-
-def get_firmware_ts_version():
-    """Read local microbit_firmware.ts and return its embedded version string (if any)."""
-    p = find_local_firmware_ts()
-    if not p:
-        return None
+def download_github_to_temp(url, suffix):
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = f.read(2048)  # only need header area
-        return parse_version_from_ts(data)
-    except Exception:
-        return None
-
-def get_local_version():
-    # read first few lines of this file to find version on top line
-    try:
-        with open(__file__, "r", encoding="utf-8") as f:
-            first_chunk = "".join([next(f) for _ in range(5)])
-        return parse_version_from_text(first_chunk)
-    except Exception:
-        return __version__
-
-def get_github_version():
-    """Fetch the online TypeScript firmware and parse its embedded version."""
-    try:
-        r = requests.get(GITHUB_RAW_URL, timeout=10)
+        r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
-        return parse_version_from_ts(r.text)
-    except Exception:
-        return None
-
-def download_github_raw_to_temp():
-    """Download the online firmware TS to a temporary .ts file and return its path."""
-    try:
-        r = requests.get(GITHUB_RAW_URL, timeout=15)
-        r.raise_for_status()
-        fd, path = tempfile.mkstemp(suffix=".ts")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(r.text)
+        if "404: Not Found" in r.text: return None
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        mode = 'w' if suffix in ['.ts', '.py'] else 'wb'
+        with os.fdopen(fd, mode, encoding='utf-8' if mode == 'w' else None) as f: 
+            f.write(r.text if mode == 'w' else r.content)
         return path
-    except Exception:
+    except Exception as e:
+        print(f"Debug: download error for {url}: {e}", file=sys.stderr)
         return None
 
-def get_device_version():
+def ts_to_python(ts_path):
+    """Convert TypeScript to Python (improved conversion)"""
     try:
-        ports = serial.tools.list_ports.comports()
-        for port in ports:
-            desc = (port.description or "").upper()
-            if "MICROBIT" in desc or "MICRO:BIT" in desc:
-                ser = serial.Serial(port.device, 115200, timeout=1)
-                time.sleep(2)
-                ser.write(b"get_firmware_version\n")
-                line = ser.readline().decode(errors="ignore").strip()
-                ser.close()
-                if line:
-                    return line
-        return None
-    except Exception:
+        with open(ts_path, 'r', encoding='utf-8') as f:
+            ts_code = f.read()
+        
+        # Improved TS to Python conversion for MicroPython
+        py_code = ts_code
+        
+        # Remove TypeScript type annotations
+        py_code = __import__('re').sub(r':\s*\w+(?=\s*[=,\)])', '', py_code)
+        py_code = __import__('re').sub(r'<\w+>', '', py_code)
+        
+        # Variable declarations
+        py_code = py_code.replace("let ", "")
+        py_code = py_code.replace("const ", "")
+        py_code = py_code.replace("var ", "")
+        
+        # Functions
+        py_code = py_code.replace("function ", "def ")
+        py_code = py_code.replace("=>", "lambda")
+        
+        # Console/logging
+        py_code = py_code.replace("console.log", "print")
+        
+        # Comparisons
+        py_code = py_code.replace("===", "==")
+        py_code = py_code.replace("!==", "!=")
+        
+        # Remove semicolons
+        py_code = py_code.replace(";", "")
+        
+        # Fix braces - convert to proper Python indentation
+        lines = py_code.split('\n')
+        fixed_lines = []
+        indent_level = 0
+        
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                fixed_lines.append("")
+                continue
+            
+            # Decrease indent for closing braces
+            if stripped.startswith("}"):
+                indent_level = max(0, indent_level - 1)
+                continue
+            
+            # Add proper indentation
+            if stripped.endswith("{"):
+                fixed_lines.append("    " * indent_level + stripped[:-1] + ":")
+                indent_level += 1
+            else:
+                fixed_lines.append("    " * indent_level + stripped)
+            
+            # Increase indent after opening braces
+            if "{" in stripped and not stripped.endswith("{"):
+                indent_level += 1
+        
+        py_code = "\n".join(fixed_lines)
+        
+        # Add MicroPython imports if needed
+        if "print" in py_code and "from microbit import" not in py_code:
+            py_code = "from microbit import *\n\n" + py_code
+        
+        fd, py_path = tempfile.mkstemp(suffix=".py")
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(py_code)
+        print(f"Debug: Converted TS to Python", file=sys.stderr)
+        return py_path
+    except Exception as e:
+        print(f"Debug: TS to Python conversion failed: {e}", file=sys.stderr)
         return None
 
-def find_microbit_drive():
-    """Return root path of connected micro:bit mass storage (e.g. 'E:\\') or None."""
-    for d in string.ascii_uppercase:
-        root = f"{d}:\\"
-        if not os.path.exists(root):
-            continue
-        try:
-            for name in os.listdir(root):
-                if name.upper() == "MICROBIT.HTM":
-                    return root
-        except Exception:
-            continue
+def compile_python_to_hex(py_path):
+    """Compile Python to HEX using uflash"""
+    try:
+        # Ensure uflash is installed
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "uflash"],
+            timeout=30,
+            capture_output=True
+        )
+        
+        # Create a temporary directory for uflash output
+        hex_dir = tempfile.mkdtemp()
+        
+        # uflash expects a directory path, not a file
+        result = subprocess.run(
+            [sys.executable, "-m", "uflash", py_path, hex_dir],
+            capture_output=True,
+            timeout=60
+        )
+        
+        # Look for micropython.hex in the directory
+        micropython_hex = os.path.join(hex_dir, "micropython.hex")
+        if os.path.exists(micropython_hex) and os.path.getsize(micropython_hex) > 100:
+            fd, out = tempfile.mkstemp(suffix=".hex")
+            with open(micropython_hex, 'rb') as src, os.fdopen(fd, 'wb') as dst:
+                dst.write(src.read())
+            shutil.rmtree(hex_dir, ignore_errors=True)
+            print(f"Debug: Compiled Python to HEX with uflash", file=sys.stderr)
+            return out
+        
+        print(f"Debug: uflash output: {result.stderr.decode()}", file=sys.stderr)
+        shutil.rmtree(hex_dir, ignore_errors=True)
+    except Exception as e:
+        print(f"Debug: Python to HEX compilation failed: {e}", file=sys.stderr)
+    
     return None
 
-def flash_script_to_microbit(file_path, target_name=None):
-    """
-    Copy a file to the micro:bit drive to flash it.
-    - file_path: path to .py/.hex/.uf2/.ts file or script to flash
-    - target_name: optional filename to use on the device (defaults to basename or 'main.py' for .py)
-    Returns True on success, False otherwise.
-    """
-    drive = find_microbit_drive()
-    if not drive:
-        print("Micro:bit drive not found.")
-        return False
-    if not os.path.isfile(file_path):
-        print("Source file not found:", file_path)
-        return False
-    src_basename = os.path.basename(file_path)
-    if not target_name:
-        if file_path.lower().endswith((".hex", ".uf2", ".ts")):
-            target_name = src_basename
-        else:
-            target_name = "main.py"
-    dest = os.path.join(drive, target_name)
+def flash_with_uflash(bin_path):
     try:
-        # attempt atomic copy
-        shutil.copy(file_path, dest)
-        print(f"Flashed {target_name} to {drive}")
-        return True
-    except Exception as e:
-        print("Failed to flash:", e)
-        return False
+        import uflash; uflash.flash(bin_path); return True
+    except (ImportError, Exception):
+        try: subprocess.check_call([sys.executable, "-m", "uflash", bin_path]); return True
+        except Exception: return False
 
-def flash_current_script_as_main():
-    """Flash this script to the micro:bit as main.py."""
-    return flash_script_to_microbit(__file__, target_name="main.py")
-
-# --- new helpers to use the provided microbit_firmware.ts as firmware script ---
-def flash_local_firmware_ts(target_name="firmware.ts"):
-    """Flash the local microbit_firmware.ts to the micro:bit drive as target_name."""
-    src = find_local_firmware_ts()
-    if not src:
-        print("Local firmware script microbit_firmware.ts not found.")
-        return False
-    return flash_script_to_microbit(src, target_name=target_name)
-# --- end new helpers ---
-
-def compare_semver(a, b):
-    if not a or not b: return None
-    try:
-        pa = [int(x) for x in re.sub(r'[^0-9.]', '', a).split('.') if x != '']
-        pb = [int(x) for x in re.sub(r'[^0-9.]', '', b).split('.') if x != '']
-        # normalize lengths
-        L = max(len(pa), len(pb))
-        pa += [0] * (L - len(pa)); pb += [0] * (L - len(pb))
-        if pa == pb: return 0
-        return 1 if pa > pb else -1
-    except Exception:
-        return None
-
-def check_firmware_update():
-    # Only check the online firmware TS file for repository version
-    local = get_local_version()
-    repo_version = get_github_version()
-    device = get_device_version()
-
-    print(f"Local checker version: {local or 'unknown'}")
-    print(f"Repository firmware version: {repo_version or 'unknown'}")
-    if repo_version:
-        cmp = compare_semver(local, repo_version)
-        if cmp == -1:
-            print("A newer checker/firmware is available in repository.")
-        elif cmp == 1:
-            print("Local checker is newer than repository.")
-        else:
-            print("Checker is up to date with repository.")
-    else:
-        print("Could not fetch repository firmware version.")
-
-    if device:
-        print(f"Device firmware version: {device}")
-        if repo_version:
-            cmp2 = compare_semver(device, repo_version)
-            if cmp2 == -1:
-                print("Device firmware is older than repository firmware. Consider updating the device.")
-            elif cmp2 == 1:
-                print("Device firmware is newer than repository firmware.")
-            else:
-                print("Device firmware matches repository firmware.")
-    else:
-        print("Could not detect device firmware version.")
-        print("Device firmware version not found. You can flash the local firmware script microbit_firmware.ts to the device:")
-        print("  python update_checker.py flash-firmware")
-        print("Or flash any file manually with:")
-        print("  python update_checker.py flash <path>")
-        print("See the repository README for flashing instructions.")
-
-def print_usage():
-    print("Usage:")
-    print("  python update_checker.py             # check versions")
-    print("  python update_checker.py flash-self  # flash this script as main.py")
-    print("  python update_checker.py flash <path> # flash given file to micro:bit")
-    print("  python update_checker.py flash-latest # download latest firmware TS from repo and flash to device")
-    print("  python update_checker.py flash-firmware # flash local microbit_firmware.ts to device")
-
-def main(argv):
-    if len(argv) <= 1:
-        check_firmware_update()
-        return
-    cmd = argv[1].lower()
-    if cmd == "flash-self":
-        ok = flash_current_script_as_main()
-        if not ok:
-            sys.exit(1)
-    elif cmd == "flash":
-        if len(argv) < 3:
-            print("Missing file path.")
-            print_usage()
-            sys.exit(2)
-        path = argv[2]
-        ok = flash_script_to_microbit(path)
-        if not ok:
-            sys.exit(1)
-    elif cmd == "flash-latest":
-        temp = download_github_raw_to_temp()
-        if not temp:
-            print("Failed to download latest firmware TS.")
-            sys.exit(1)
-        try:
-            ok = flash_script_to_microbit(temp, target_name=os.path.basename(temp))
-            if not ok:
-                sys.exit(1)
-        finally:
+def find_microbit_drive():
+    for d in string.ascii_uppercase:
+        root = f"{d}:/"
+        if os.path.exists(root):
             try:
-                os.remove(temp)
-            except Exception:
-                pass
-    elif cmd == "flash-firmware":
-        ok = flash_local_firmware_ts(target_name="firmware.ts")
-        if not ok:
-            sys.exit(1)
-    else:
-        print_usage()
-        sys.exit(2)
+                if any(n.upper() == "MICROBIT.HTM" for n in os.listdir(root)): return root
+            except Exception: pass
+    return None
 
-if __name__ == "__main__":
-    main(sys.argv)
+def flash_to_drive(bin_path):
+    drive = find_microbit_drive()
+    if not drive: return False
+    ext = os.path.splitext(bin_path)[1]
+    target = os.path.join(drive, f"firmware{ext}")
+    try: 
+        shutil.copy2(bin_path, target)
+        return True
+    except Exception: return False
+
+def cleanup(*paths):
+    for p in paths:
+        try:
+            if p and os.path.exists(p): os.remove(p)
+        except Exception: pass
+
+def flash_latest_immediately():
+    # Try downloading pre-compiled Python first
+    py = download_github_to_temp(GITHUB_PY_URL, ".py")
+    if not py:
+        # Fall back to downloading TS and converting
+        ts = download_github_to_temp(GITHUB_RAW_URL, ".ts")
+        if not ts: print("Status: download-failed"); return 1
+        py = ts_to_python(ts)
+        cleanup(ts)
+    
+    if not py: print("Status: download-failed"); return 1
+    
+    binf = None
+    try:
+        binf = compile_python_to_hex(py)
+        if not binf: print("Status: compile-failed"); return 1
+        # Skip uflash.flash() - go straight to drive
+        if flash_to_drive(binf): print("Status: flashed-via-drive"); return 0
+        print("Status: flash-failed"); return 1
+    finally: cleanup(py, binf)
+
+if __name__ == "__main__": 
+    sys.exit(flash_latest_immediately())
