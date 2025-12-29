@@ -1,0 +1,8 @@
+Firmware Version 2026.01.3
+WORKS FOR Microbit V2 ONLY
+
+Description:
+This Firmware has support for the micro:bit V2 using bluetooth and serial, you can send you own commands, 
+and make a custom firmware (I supplied one).
+
+Use it well.

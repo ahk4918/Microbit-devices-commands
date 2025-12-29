@@ -133,8 +133,8 @@ class Microbit:
             print(f"--- 2025 micro:bit Hybrid Controller (Mode: {mode}) ---")
             self.mode = mode.upper()
             self.current_mode = None
-            self.ser: Optional[serial.Serial] = None
-            self.ble_client: Optional[BleakClient] = None
+            self.ser: Optional[serial.Serial] = None #type: ignore
+            self.ble_client: Optional[BleakClient] = None #type: ignore
             self.active_rx = RX_UUID 
             self.loop = asyncio.new_event_loop()
             threading.Thread(target=self._run_loop, daemon=True).start()
@@ -193,7 +193,7 @@ class Microbit:
 
 if __name__ == "__main__":
     # Example usage of Arduino class
-    board = Microbit(dev_mode=True)
+    board = Microbit(mode="SERIAL", dev_mode=True)
     if board.ser:
         try:
             while True:
