@@ -2,17 +2,22 @@ import asyncio
 import os
 import sys
 import threading
+import signal
+import time
+import subprocess
+from typing import Optional
+
 import requests
 import serial
 import serial.tools.list_ports
-from typing import Optional
 from bleak import BleakScanner, BleakClient
 
 # ---------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------
+
 VERSION_URL = "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/DETAILS.TXT"
-INTERPRETER_URL = "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/interpreter.hex"
+INTERPRETER_URL = "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/microbit-interpreter.hex"
 
 UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # micro:bit -> PC
@@ -26,8 +31,10 @@ USB_KEYWORDS = [
     "mbed",
     "serial",
     "usb serial device",
-    "usb composite"
+    "usb composite",
 ]
+
+KNOWN_VIDS = {0x0D28}  # mbed / DAPLink VID
 
 
 # ---------------------------------------------------------
@@ -38,7 +45,7 @@ def find_microbit_drive():
         import win32api
         import win32file
     except ImportError:
-        print("⚠ pywin32 required: pip install pywin32")
+        print("⚠ pywin32 required for drive detection: pip install pywin32")
         return None
 
     drives = win32api.GetLogicalDriveStrings().split("\x00")
@@ -52,80 +59,178 @@ def find_microbit_drive():
                 label = win32api.GetVolumeInformation(d)[0].lower()
                 if "microbit" in label or "mbed" in label or "daplink" in label:
                     return d
-        except:
+        except Exception:
             pass
 
     return None
 
 
 # ---------------------------------------------------------
-# VERSION CHECKING
+# NETWORK HELPERS
 # ---------------------------------------------------------
-def get_remote_interpreter_version():
+def safe_download(url: str, attempts: int = 3, stream: bool = False):
+    for i in range(attempts):
+        try:
+            r = requests.get(url, timeout=10, stream=stream)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            print(f"Download attempt {i + 1} failed: {e}")
+            if i < attempts - 1:
+                time.sleep(1.2)
+    return None
+
+
+# ---------------------------------------------------------
+# VERSION CHECKING (REMOTE)
+# ---------------------------------------------------------
+def get_remote_interpreter_version() -> Optional[str]:
+    """
+    Remote version is taken from the first line of the GitHub DETAILS.TXT, e.g.:
+    'Firmware Version 2026.01.3'
+    We parse out '2026.01.3'.
+    """
+    r = safe_download(VERSION_URL, stream=False)
+    if not r:
+        return None
+
     try:
-        r = requests.get(VERSION_URL, timeout=5)
-        r.raise_for_status()
-        return r.text.splitlines()[0].strip()
-    except:
+        first_line = r.text.splitlines()[0].strip().lstrip("\ufeff")
+        parts = first_line.split()
+        if not parts:
+            return None
+        # Assume version is the last token
+        return parts[-1]
+    except Exception:
         return None
+# ---------------------------------------------------------
+# HEX VALIDATION
+# ---------------------------------------------------------
+def validate_hex_file(path: str) -> bool:
+    """
+    Validates that a HEX file is safe to flash to a micro:bit.
+    Checks:
+    - File exists
+    - Minimum size
+    - Ends with proper EOF record
+    - Contains required extended linear address records
+    - All lines follow Intel HEX format
+    """
+    if not os.path.exists(path):
+        print("❌ HEX validation failed: file does not exist.")
+        return False
 
+    size = os.path.getsize(path)
+    if size < 1024:
+        print("❌ HEX validation failed: file too small.")
+        return False
 
-def get_installed_interpreter_version_from_microbit():
-    drive = find_microbit_drive()
-    if not drive:
-        return None
-
-    version_file = os.path.join(drive, "version.txt")
-    if not os.path.exists(version_file):
-        return None
+    has_ext_addr = False
+    eof_ok = False
 
     try:
-        with open(version_file, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except:
-        return None
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
 
+                # Must start with ':'
+                if not line.startswith(":"):
+                    print("❌ HEX validation failed: line missing ':' prefix.")
+                    return False
+
+                # Check EOF record
+                if line.upper() == ":00000001FF":
+                    eof_ok = True
+
+                # Check for extended linear address record
+                # :02000004xxxxxx
+                if line.startswith(":02000004"):
+                    has_ext_addr = True
+
+                # Basic Intel HEX format check
+                try:
+                    byte_count = int(line[1:3], 16)
+                    address = int(line[3:7], 16)
+                    record_type = int(line[7:9], 16)
+                except Exception:
+                    print("❌ HEX validation failed: malformed record.")
+                    return False
+
+                # Length check
+                if len(line) != (11 + byte_count * 2):
+                    print("❌ HEX validation failed: incorrect line length.")
+                    return False
+
+    except Exception as e:
+        print(f"❌ HEX validation failed: {e}")
+        return False
+
+    if not eof_ok:
+        print("❌ HEX validation failed: missing EOF record ':00000001FF'.")
+        return False
+
+    if not has_ext_addr:
+        print("❌ HEX validation failed: missing extended linear address record.")
+        return False
+
+    print("✔ HEX file validated successfully.")
+    return True
 
 # ---------------------------------------------------------
-# FLASH INTERPRETER (TEMP-FILE FIX)
+# FLASH INTERPRETER
 # ---------------------------------------------------------
-def flash_interpreter_direct():
+def flash_interpreter_direct() -> bool:
     drive = find_microbit_drive()
     if not drive:
         print("❌ MICROBIT drive not found.")
         return False
 
-    print("Downloading interpreter...")
-    try:
-        r = requests.get(INTERPRETER_URL, timeout=10, stream=True)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"Download failed: {e}")
+    print("Downloading interpreter.hex...")
+    r = safe_download(INTERPRETER_URL, stream=True)
+    if not r:
+        print("❌ Could not download interpreter after retries.")
         return False
 
-    temp_path = os.path.join(drive, "interpreter.tmp")
-    final_path = os.path.join(drive, "interpreter.hex")
+    temp_path = os.path.join(drive, "microbit-interpreter.tmp")
+    final_path = os.path.join(drive, "microbit-interpreter.hex")
 
     print(f"Flashing interpreter to {final_path}...")
 
     try:
-        # Write to temp file
+        # Write file safely
         with open(temp_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=4096):
                 if chunk:
                     f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
 
-        # Hide temp file so Windows ignores it
+        # Hide temp file (optional)
         try:
             import ctypes
             FILE_ATTRIBUTE_HIDDEN = 0x02
             FILE_ATTRIBUTE_SYSTEM = 0x04
-            ctypes.windll.kernel32.SetFileAttributesW(temp_path, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)
-        except:
+            ctypes.windll.kernel32.SetFileAttributesW(
+                temp_path, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+            )
+        except Exception:
             pass
 
-        # Rename to .hex
+        # Move into place
         os.replace(temp_path, final_path)
+        # Validate HEX before flashing
+        if not validate_hex_file(final_path):
+            print("❌ Interpreter HEX failed validation. Aborting flash.")
+            return False
+
+        # Validate size
+        size = os.path.getsize(final_path)
+        if size < 1024:
+            print("❌ Flash failed: resulting file too small.")
+            return False
+
+        # 🔥 REQUIRED: allow Windows to finish writing to USB
+        time.sleep(0.4)
 
         print("Interpreter copied. Micro:bit will reboot and flash.")
         return True
@@ -134,66 +239,60 @@ def flash_interpreter_direct():
         print(f"Flash failed: {e}")
         return False
 
-
 # ---------------------------------------------------------
 # SAFE RESTART
 # ---------------------------------------------------------
 def restart_script():
-    os.system("python microbit-controller.py")
+    print("Restarting controller...")
+    script = os.path.abspath(__file__)
+    subprocess.Popen([sys.executable, script])
     sys.exit(0)
-
-
-# ---------------------------------------------------------
-# UPDATE LOGIC
-# ---------------------------------------------------------
-def perform_interpreter_update():
-    remote = get_remote_interpreter_version()
-    installed = get_installed_interpreter_version_from_microbit()
-
-    print(f"\nInstalled interpreter: {installed}")
-    print(f"Available interpreter: {remote}")
-
-    if not remote:
-        print("⚠ Could not check remote version.")
-        return
-
-    if installed == remote:
-        print("Interpreter is up to date.")
-        return
-
-    choice = input("Update interpreter now? (y/n): ").strip().lower()
-    if choice != "y":
-        return
-
-    if flash_interpreter_direct():
-        print("Update complete. Restarting controller...")
-        restart_script()
 
 
 # ---------------------------------------------------------
 # MICROBIT CONTROLLER
 # ---------------------------------------------------------
 class Microbit:
-    def __init__(self, mode="BOTH", dev_mode=False):
+    def __init__(self, mode: str = "BOTH", dev_mode: bool = False, version_check: bool = True):
         self.dev_mode = dev_mode
+        self.version_check = version_check
         self.mode = mode.upper()
-        self.current_mode = None
+        self.current_mode: Optional[str] = None
+
         self.ser: Optional[serial.Serial] = None
         self.ble_client: Optional[BleakClient] = None
         self.active_rx = RX_UUID
 
-        print(f"--- micro:bit Interpreter Controller (Mode: {mode}) ---")
+        self._serial_lock = threading.Lock()
 
-        # Start async loop
+        # Version query synchronization
+        self._waiting_for_version = False
+        self._version_event = threading.Event()
+        self._version_value: Optional[str] = None
+
+        print(f"--- micro:bit Interpreter Controller (Mode: {self.mode}) ---")
+
+        # Start async event loop in background thread
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self._run_loop, daemon=True).start()
 
-        # Check for interpreter updates
-        perform_interpreter_update()
-
-        # Connect
+        # Connect first (we need a connection to query installed version)
         self.reconnect()
 
+        # Perform version check after connection
+        if self.version_check and self.current_mode is not None:
+            self.perform_interpreter_update()
+
+    # ---------------------------
+    # LOGGING
+    # ---------------------------
+    def log(self, msg: str):
+        if self.dev_mode:
+            print(f"[DEBUG] {msg}")
+
+    # ---------------------------
+    # ASYNC LOOP
+    # ---------------------------
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
@@ -202,40 +301,56 @@ class Microbit:
     # CONNECTION
     # ---------------------------
     def reconnect(self):
-        print("\n[DEBUG] Serial ports:")
-        for p in serial.tools.list_ports.comports():
-            print(f" - {p.device}: {p.description}")
+        print("\nScanning for micro:bit devices...")
 
-        # USB
+        # USB first
         if self.mode in ["BOTH", "SERIAL"]:
-            for p in serial.tools.list_ports.comports():
-                desc = (p.description or "").lower()
-                if any(k in desc for k in USB_KEYWORDS):
-                    try:
-                        self.ser = serial.Serial(p.device, 115200, timeout=1)
-                        self.current_mode = "SERIAL"
-                        self._start_serial_listener()
-                        print(f"Connected via USB ({p.device})")
-                        return
-                    except:
-                        pass
+            if self._try_connect_serial():
+                return
 
-        # BLE
+        # BLE next
         if self.mode in ["BOTH", "BLE"]:
             future = asyncio.run_coroutine_threadsafe(self._connect_ble(), self.loop)
             try:
                 if future.result(timeout=35):
                     self.current_mode = "BLE"
-                    print("Connected via Bluetooth")
+                    print("Connected via Bluetooth.")
                     return
-            except:
-                pass
+            except Exception as e:
+                self.log(f"BLE connection error: {e}")
 
         print("Connection failed.")
+        self.current_mode = None
 
-    async def _connect_ble(self):
+    def _try_connect_serial(self) -> bool:
+        for p in serial.tools.list_ports.comports():
+            desc = (p.description or "").lower()
+            vid = getattr(p, "vid", None)
+
+            matches_keyword = any(k in desc for k in USB_KEYWORDS)
+            matches_vid = vid in KNOWN_VIDS if vid is not None else False
+
+            if not (matches_keyword or matches_vid):
+                continue
+
+            try:
+                self.ser = serial.Serial(p.device, 115200, timeout=1)
+                self.current_mode = "SERIAL"
+                self._start_serial_listener()
+                print(f"Connected via USB ({p.device})")
+                return True
+            except Exception as e:
+                self.log(f"Failed to open serial port {p.device}: {e}")
+
+        return False
+
+    async def _connect_ble(self) -> bool:
         print("Scanning for BLE devices...")
-        devices = await BleakScanner.discover(timeout=10.0)
+        try:
+            devices = await BleakScanner.discover(timeout=10.0)
+        except Exception as e:
+            print(f"BLE scan failed: {e}")
+            return False
 
         candidates = [d for d in devices if "micro" in (d.name or "").lower()]
 
@@ -247,19 +362,35 @@ class Microbit:
         print(f"Connecting to {target.name} [{target.address}]")
 
         self.ble_client = BleakClient(target)
-        await self.ble_client.connect()
+
+        try:
+            await self.ble_client.connect()
+        except Exception as e:
+            print(f"BLE connection failed: {e}")
+            return False
 
         try:
             await self.ble_client.start_notify(TX_UUID, self._on_data_received)
             self.active_rx = RX_UUID
+            print("BLE notifications on TX_UUID, writing to RX_UUID.")
             return True
-        except:
+        except Exception:
+            self.log("TX notify failed, trying RX...")
+
+        try:
+            await self.ble_client.start_notify(RX_UUID, self._on_data_received)
+            self.active_rx = TX_UUID
+            print("BLE notifications on RX_UUID, writing to TX_UUID.")
+            return True
+        except Exception as e:
+            print(f"BLE notify setup failed: {e}")
             try:
-                await self.ble_client.start_notify(RX_UUID, self._on_data_received)
-                self.active_rx = TX_UUID
-                return True
-            except:
-                return False
+                if self.ble_client and self.ble_client.is_connected:
+                    await self.ble_client.disconnect()
+            except Exception:
+                pass
+            self.ble_client = None
+            return False
 
     # ---------------------------
     # DATA HANDLING
@@ -270,18 +401,37 @@ class Microbit:
         else:
             msg = str(data).strip()
 
-        if msg:
-            print(f"\n[MICROBIT]: {msg}\n> ", end="")
+        if not msg:
+            return
+
+        # If we are currently waiting for a version response, capture this message
+        if self._waiting_for_version and self._version_value is None:
+            self._version_value = msg
+            self._waiting_for_version = False
+            self._version_event.set()
+            self.log(f"Captured version response: {msg}")
+            return
+
+        print(f"\n[MICROBIT]: {msg}\n> ", end="", flush=True)
 
     def _start_serial_listener(self):
         def listen():
-            while self.ser and self.ser.is_open:
-                try:
-                    line = self.ser.readline().decode(errors="ignore").strip()
-                    if line:
-                        self._on_data_received(None, line)
-                except:
-                    break
+            while True:
+                with self._serial_lock:
+                    if not self.ser or not self.ser.is_open:
+                        break
+                    try:
+                        line = self.ser.readline().decode(errors="ignore").strip()
+                    except Exception:
+                        break
+
+                if line:
+                    self._on_data_received(None, line)
+
+            print("\n[INFO] Serial disconnected. Reconnecting...")
+            self.ser = None
+            self.current_mode = None
+            self.reconnect()
 
         threading.Thread(target=listen, daemon=True).start()
 
@@ -290,24 +440,109 @@ class Microbit:
     # ---------------------------
     def send(self, cmd: str):
         msg = (cmd.strip() + "\n").encode()
+
         if self.current_mode == "SERIAL" and self.ser:
-            self.ser.write(msg)
+            try:
+                with self._serial_lock:
+                    self.ser.write(msg)
+            except Exception:
+                print("Serial write failed. Reconnecting...")
+                self.reconnect()
+
         elif self.current_mode == "BLE" and self.ble_client:
-            asyncio.run_coroutine_threadsafe(
-                self.ble_client.write_gatt_char(self.active_rx, msg, response=False),
-                self.loop
-            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.ble_client.write_gatt_char(self.active_rx, msg, response=False),
+                    self.loop,
+                )
+            except Exception:
+                print("BLE write failed. Reconnecting...")
+                self.reconnect()
 
+        else:
+            print("Not connected. Attempting to reconnect...")
+            self.reconnect()
 
-# ---------------------------------------------------------
-# MAIN LOOP
-# ---------------------------------------------------------
+    # ---------------------------
+    # VERSION QUERY (INSTALLED)
+    # ---------------------------
+    def get_installed_interpreter_version(self, timeout: float = 3.0) -> Optional[str]:
+        """
+        Ask the micro:bit for its interpreter version by sending 'version'
+        and waiting for the next message. Assumes the interpreter replies
+        with only the version string, e.g. '2026.01.3'.
+        """
+        if self.current_mode is None:
+            self.reconnect()
+            if self.current_mode is None:
+                print("⚠ Could not connect to micro:bit to read installed version.")
+                return None
+
+        # Prepare to capture the version response
+        self._version_event.clear()
+        self._version_value = None
+        self._waiting_for_version = True
+
+        # Short delay to ensure interpreter is ready
+        time.sleep(0.3)
+
+        # Send version command
+        self.send("version")
+
+        # Wait for version response
+        if not self._version_event.wait(timeout=timeout):
+            print("⚠ Timed out waiting for version response from micro:bit.")
+            self._waiting_for_version = False
+            return None
+
+        return self._version_value
+
+    # ---------------------------
+    # UPDATE LOGIC
+    # ---------------------------
+    def perform_interpreter_update(self):
+        installed = self.get_installed_interpreter_version()
+        remote = get_remote_interpreter_version()
+
+        print(f"\nInstalled interpreter: {installed}")
+        print(f"Available interpreter: {remote}")
+
+        if not remote:
+            print("⚠ Could not check remote version.")
+            return
+
+        if installed == remote:
+            print("Interpreter is up to date.")
+            return
+
+        print("Updating interpreter to latest version...")
+        if flash_interpreter_direct():
+            print("Update complete. Restarting controller...")
+            restart_script()
+        else:
+            print("Update failed. Keeping current interpreter.")
+
 if __name__ == "__main__":
-    board = Microbit(mode="BOTH", dev_mode=True)
-
     try:
+        controller = Microbit(mode="BOTH", dev_mode=True, version_check=True)
+
+        print("\nType commands to send to the micro:bit. Type 'exit' to quit.")
         while True:
-            cmd = input("> ")
-            board.send(cmd)
+            cmd = input("> ").strip()
+            if cmd.lower() in ["exit", "quit"]:
+                print("Exiting...")
+                break
+            if cmd:
+                controller.send(cmd)
     except KeyboardInterrupt:
-        print("Exiting...")
+        print("\nExiting...")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+    finally:
+        try:
+            if controller.ble_client and controller.ble_client.is_connected:
+                asyncio.run_coroutine_threadsafe(
+                    controller.ble_client.disconnect(), controller.loop
+                )
+        except Exception:
+            pass
