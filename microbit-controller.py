@@ -42,8 +42,8 @@ KNOWN_VIDS = {0x0D28}  # mbed / DAPLink VID
 # ---------------------------------------------------------
 def find_microbit_drive():
     try:
-        import win32api
-        import win32file
+        import win32api # type: ignore
+        import win32file# type: ignore
     except ImportError:
         print("⚠ pywin32 required for drive detection: pip install pywin32")
         return None
@@ -109,12 +109,9 @@ def get_remote_interpreter_version() -> Optional[str]:
 def validate_hex_file(path: str) -> bool:
     """
     Validates that a HEX file is safe to flash to a micro:bit.
-    Checks:
-    - File exists
-    - Minimum size
-    - Ends with proper EOF record
-    - Contains required extended linear address records
-    - All lines follow Intel HEX format
+    If validation fails:
+      - Saves the entire file to invalid_hex_dump.txt
+      - Prints the exact line number and content that failed
     """
     if not os.path.exists(path):
         print("❌ HEX validation failed: file does not exist.")
@@ -128,50 +125,66 @@ def validate_hex_file(path: str) -> bool:
     has_ext_addr = False
     eof_ok = False
 
+    # Read all lines first so we can dump them if needed
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-
-                # Must start with ':'
-                if not line.startswith(":"):
-                    print("❌ HEX validation failed: line missing ':' prefix.")
-                    return False
-
-                # Check EOF record
-                if line.upper() == ":00000001FF":
-                    eof_ok = True
-
-                # Check for extended linear address record
-                # :02000004xxxxxx
-                if line.startswith(":02000004"):
-                    has_ext_addr = True
-
-                # Basic Intel HEX format check
-                try:
-                    byte_count = int(line[1:3], 16)
-                    address = int(line[3:7], 16)
-                    record_type = int(line[7:9], 16)
-                except Exception:
-                    print("❌ HEX validation failed: malformed record.")
-                    return False
-
-                # Length check
-                if len(line) != (11 + byte_count * 2):
-                    print("❌ HEX validation failed: incorrect line length.")
-                    return False
-
+            lines = f.readlines()
     except Exception as e:
-        print(f"❌ HEX validation failed: {e}")
+        print(f"❌ HEX validation failed: cannot read file: {e}")
         return False
+
+    # Helper to dump file and show error line
+    def fail(reason: str, line_num: int = None, line: str = None):#type: ignore
+        dump_path = "invalid_hex_dump.txt"
+        with open(dump_path, "w", encoding="utf-8") as dump:
+            dump.writelines(lines)
+
+        print(f"\n❌ HEX validation failed: {reason}")
+        print(f"📄 Full file saved to: {dump_path}")
+
+        if line_num is not None:
+            print(f"🔍 Error at line {line_num}:")
+            print(f"    {line.rstrip()}")
+        return False
+
+    # Validate each line
+    for idx, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+
+        # Must start with ':'
+        if not line.startswith(":"):
+            return fail("line missing ':' prefix", idx, line)
+
+        # Check EOF record
+        if line.upper() == ":00000001FF":
+            eof_ok = True
+
+        # Check extended linear address record
+        if line.startswith(":02000004"):
+            has_ext_addr = True
+
+        # Basic Intel HEX format
+        try:
+            byte_count = int(line[1:3], 16)
+            address = int(line[3:7], 16)
+            record_type = int(line[7:9], 16)
+        except Exception:
+            return fail("malformed Intel HEX record", idx, line)
+
+        # Length check
+        expected_len = 11 + byte_count * 2
+        if len(line) != expected_len:
+            return fail(
+                f"incorrect line length (expected {expected_len}, got {len(line)})",
+                idx,
+                line,
+            )
 
     if not eof_ok:
-        print("❌ HEX validation failed: missing EOF record ':00000001FF'.")
-        return False
+        return fail("missing EOF record ':00000001FF'")
 
     if not has_ext_addr:
-        print("❌ HEX validation failed: missing extended linear address record.")
-        return False
+        return fail("missing extended linear address record ':02000004xxxxxx'")
 
     print("✔ HEX file validated successfully.")
     return True
@@ -185,8 +198,8 @@ def flash_interpreter_direct() -> bool:
         print("❌ MICROBIT drive not found.")
         return False
 
-    print("Downloading interpreter.hex...")
-    r = safe_download(INTERPRETER_URL, stream=True)
+    print("Downloading interpreter (non-streaming)...")
+    r = safe_download(INTERPRETER_URL, stream=False)
     if not r:
         print("❌ Could not download interpreter after retries.")
         return False
@@ -197,15 +210,13 @@ def flash_interpreter_direct() -> bool:
     print(f"Flashing interpreter to {final_path}...")
 
     try:
-        # Write file safely
+        # Write entire file in one chunk (prevents chunk corruption)
         with open(temp_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=4096):
-                if chunk:
-                    f.write(chunk)
+            f.write(r.content)
             f.flush()
             os.fsync(f.fileno())
 
-        # Hide temp file (optional)
+        # Optional: hide temp file on Windows
         try:
             import ctypes
             FILE_ATTRIBUTE_HIDDEN = 0x02
@@ -216,20 +227,21 @@ def flash_interpreter_direct() -> bool:
         except Exception:
             pass
 
-        # Move into place
+        # Move into place atomically
         os.replace(temp_path, final_path)
-        # Validate HEX before flashing
-        if not validate_hex_file(final_path):
-            print("❌ Interpreter HEX failed validation. Aborting flash.")
-            return False
 
-        # Validate size
+        # Basic size check
         size = os.path.getsize(final_path)
         if size < 1024:
             print("❌ Flash failed: resulting file too small.")
             return False
 
-        # 🔥 REQUIRED: allow Windows to finish writing to USB
+        # Validate HEX structure
+        if not validate_hex_file(final_path):
+            print("❌ Interpreter HEX failed validation. Aborting flash.")
+            return False
+
+        # Allow Windows to finish writing to USB
         time.sleep(0.4)
 
         print("Interpreter copied. Micro:bit will reboot and flash.")
@@ -524,7 +536,7 @@ class Microbit:
 
 if __name__ == "__main__":
     try:
-        controller = Microbit(mode="BOTH", dev_mode=True, version_check=True)
+        controller = Microbit(mode="BOTH", dev_mode=True, version_check=False)
 
         print("\nType commands to send to the micro:bit. Type 'exit' to quit.")
         while True:
