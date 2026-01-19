@@ -1,8 +1,23 @@
-Firmware Version 2026.01.4
-WORKS FOR Microbit V2 ONLY
+# Micro:bit Interpreter Firmware Details
+# Unified version file for both V1 and V2 devices
+
+Firmware Version V1: 2026.01.1
+Firmware Version V2: 2026.01.4
 
 Description:
-This Firmware has support for the micro:bit V2 using bluetooth and serial, you can send you own commands, 
-and make a custom firmware (I supplied one).
+This firmware package contains interpreters for both micro:bit V1 and V2.
+Each device will automatically receive the correct firmware based on its
+board ID.
 
-Use it well.
+V1 Notes:
+- USB only
+- Minimal feature set
+- Designed to fit within V1 flash/RAM limits
+
+V2 Notes:
+- USB + Bluetooth UART
+- Full sensor suite
+- Standard feature set
+
+You can build your own custom firmware!
+Use Makecode for editing and use No Pairing Required setting for Bluetooth.

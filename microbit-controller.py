@@ -5,18 +5,15 @@ from packaging.version import Version
 DEFAULT_BAUD = 115200
 
 FIRMWARE_V1_URL = (
-    "https://raw.githubusercontent.com/"
-    "ahk4918/Microbit-devices-commands/main/firmware_v1.hex"
+    "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/microbit-interpreterV1.hex"
 )
 
 FIRMWARE_V2_URL = (
-    "https://raw.githubusercontent.com/"
-    "ahk4918/Microbit-devices-commands/main/firmware_v2.hex"
+    "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/microbit-interpreterV2.hex"
 )
 
 DETAILS_URL = (
-    "https://raw.githubusercontent.com/"
-    "ahk4918/Microbit-devices-commands/main/DETAILS.TXT"
+    "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/DETAILS.TXT"
 )
 
 BLE_DEVICE_NAME_PREFIX = "BBC micro:bit"
@@ -36,6 +33,17 @@ class Microbit:
         self.ble_rx_buffer = []
         self.ble_lock = threading.Lock()
 
+        # Hardware type: "microbit-v1" or "microbit-v2" or None
+        self.hw_type = None
+        # Feature flags based on hardware
+        self.features = {
+            "ble": True,
+            "tone": True,
+            "sound": True,
+            "accel": True,
+            "compass": True,
+        }
+
         import asyncio
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -51,6 +59,28 @@ class Microbit:
         import asyncio
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
+
+    # ---------- FEATURE RESTRICTIONS ----------
+    def apply_feature_restrictions(self, hw_type):
+        self.hw_type = hw_type
+        if hw_type == "microbit-v1":
+            # Strict: no BLE, no V2-only features
+            self.features["ble"] = False
+            self.features["tone"] = False
+            self.features["sound"] = False
+            self.features["accel"] = False
+            self.features["compass"] = False
+            self._devlog("Applied V1 feature restrictions")
+        elif hw_type == "microbit-v2":
+            # Full feature set
+            self.features["ble"] = True
+            self.features["tone"] = True
+            self.features["sound"] = True
+            self.features["accel"] = True
+            self.features["compass"] = True
+            self._devlog("Applied V2 full feature set")
+        else:
+            self._devlog("Unknown hardware type; leaving features default")
 
     # ---------- USB ----------
     def connect_usb(self):
@@ -183,6 +213,10 @@ class Microbit:
         return False
 
     def connect_ble(self):
+        if not self.features.get("ble", True):
+            self._devlog("BLE disabled by feature restrictions")
+            return False
+
         import asyncio
         fut = asyncio.run_coroutine_threadsafe(self._ble_open_async(), self._loop)
         try:
@@ -215,14 +249,17 @@ class Microbit:
             self._devlog(f"BLE RX: {text!r}")
             return text
 
-    # ---------- Unified ----------
+    # ---------- Unified connect ----------
     def connect(self):
         print("Trying USB...")
         if self.connect_usb():
             return True
 
-        print("Trying BLE...")
-        return self.connect_ble()
+        if self.features.get("ble", True):
+            print("Trying BLE...")
+            return self.connect_ble()
+
+        return False
 
     def write(self, line):
         if self.mode == "usb":
@@ -237,44 +274,7 @@ class Microbit:
             return self._ble_read()
         return ""
 
-    # ---------- Version ----------
-    def get_latest_version(self):
-        self._devlog("Fetching latest version from server")
-        try:
-            r = requests.get(DETAILS_URL, timeout=10)
-            first = r.text.splitlines()[0]
-            for token in first.split():
-                if token[0].isdigit():
-                    self._devlog(f"Latest version = {token}")
-                    return token
-        except Exception as e:
-            self._devlog(f"Version fetch failed: {e}")
-            return None
-        return None
-
-    def get_device_version(self):
-        self._devlog("Requesting device version")
-        self.write("version")
-        time.sleep(0.2)
-        out = self.read()
-
-        version = None
-        dtype = None
-        devtype = None
-
-        for line in out.splitlines():
-            line = line.strip()
-            if line.startswith("Version:"):
-                version = line.split(":", 1)[1].strip()
-            if line.startswith("Type:"):
-                dtype = line.split(":", 1)[1].strip()
-            if line.startswith("Device Type:"):
-                devtype = line.split(":", 1)[1].strip()
-
-        self._devlog(f"Device version={version}, type={dtype}, devtype={devtype}")
-        return version, dtype, devtype
-
-    # ---------- Drive + DETAILS.TXT ----------
+    # ---------- DETAILS.TXT on device ----------
     def find_drive(self):
         self._devlog("Searching for MICROBIT drive...")
 
@@ -333,7 +333,6 @@ class Microbit:
             self._devlog("No board id found in DETAILS.TXT")
             return None
 
-        # Rule: V1 → 02xx, V2 → 99xx
         if board_id.startswith("02"):
             self._devlog("Detected micro:bit V1 from board id prefix 02xx")
             return "microbit-v1"
@@ -348,6 +347,53 @@ class Microbit:
 
         self._devlog("DETAILS.TXT did not look like a micro:bit")
         return None
+
+    # ---------- GitHub DETAILS.TXT parsing ----------
+    def get_latest_versions(self):
+        """
+        Parse unified DETAILS.TXT from GitHub:
+        Firmware Version V1: X.Y.Z
+        Firmware Version V2: X.Y.Z
+        """
+        self._devlog("Fetching latest versions from server")
+        latest_v1 = None
+        latest_v2 = None
+        try:
+            r = requests.get(DETAILS_URL, timeout=10)
+            for line in r.text.splitlines():
+                line = line.strip()
+                if line.lower().startswith("firmware version v1:"):
+                    latest_v1 = line.split(":", 1)[1].strip()
+                elif line.lower().startswith("firmware version v2:"):
+                    latest_v2 = line.split(":", 1)[1].strip()
+            self._devlog(f"Latest V1={latest_v1}, V2={latest_v2}")
+        except Exception as e:
+            self._devlog(f"Version fetch failed: {e}")
+            return None, None
+        return latest_v1, latest_v2
+
+    # ---------- Device version ----------
+    def get_device_version(self):
+        self._devlog("Requesting device version")
+        self.write("version")
+        time.sleep(0.2)
+        out = self.read()
+
+        version = None
+        dtype = None
+        devtype = None
+
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Version:"):
+                version = line.split(":", 1)[1].strip()
+            if line.startswith("Type:"):
+                dtype = line.split(":", 1)[1].strip()
+            if line.startswith("Device Type:"):
+                devtype = line.split(":", 1)[1].strip()
+
+        self._devlog(f"Device version={version}, type={dtype}, devtype={devtype}")
+        return version, dtype, devtype
 
     # ---------- Flash ----------
     def flash(self, devtype):
@@ -387,45 +433,94 @@ class Microbit:
         time.sleep(3)
         return True
 
-    # ---------- Update ----------
+    # ---------- Update / Version logic ----------
     def ensure_updated(self):
-        latest = self.get_latest_version()
-        if not latest:
-            print("Could not fetch latest version.")
+        latest_v1, latest_v2 = self.get_latest_versions()
+        if not latest_v1 and not latest_v2:
+            print("Could not fetch latest version info.")
             return True
+
+        # Determine hardware type if not already known
+        if not self.hw_type:
+            hw = self.detect_device_from_details()
+            if hw:
+                self.apply_feature_restrictions(hw)
+            else:
+                print("Could not determine hardware type.")
+                return False
 
         device, dtype, devtype = self.get_device_version()
 
+        # If device is silent, fallback to flashing based on hardware type
         if not device:
             print("Device did not respond to version. Checking USB drive...")
             self._devlog("Device silent, using DETAILS.TXT fallback")
-            devtype = self.detect_device_from_details()
-            if not devtype:
-                print("No micro:bit detected.")
-                return False
+            if not self.hw_type:
+                hw = self.detect_device_from_details()
+                if not hw:
+                    print("No micro:bit detected.")
+                    return False
+                self.apply_feature_restrictions(hw)
+            devtype = self.hw_type
             print(f"Detected device by DETAILS.TXT: {devtype}")
             device = "0.0.0"
             dtype = "UNKNOWN"
+
+        # Mismatch detection: V2 hardware running V1 interpreter
+        # (Flexible behavior: warn + offer upgrade, but allow console)
+        if self.hw_type == "microbit-v2" and devtype == "microbit-v1":
+            print("Warning: V2 hardware is running V1 interpreter.")
+            print("You can continue with limited features, or upgrade to V2 interpreter.")
+            choice = input("Upgrade to V2 interpreter now? [y/N]: ").strip().lower()
+            if choice == "y":
+                print("Flashing V2 interpreter...")
+                if not self.flash("microbit-v2"):
+                    print("Flash failed.")
+                    return False
+                print("Waiting for micro:bit to reboot...")
+                time.sleep(4)
+                print("Reconnecting...")
+                if not self.connect():
+                    print("Reconnect failed after flashing.")
+                    return False
+                print("Re-checking version...")
+                device2, _, devtype2 = self.get_device_version()
+                if device2 and devtype2 == "microbit-v2":
+                    print("Upgrade to V2 interpreter successful.")
+                    device = device2
+                    devtype = devtype2
+                else:
+                    print("Upgrade did not complete correctly; continuing anyway.")
+            else:
+                print("Continuing with V1 interpreter on V2 hardware (limited features).")
+
+        # Choose correct latest version based on hardware type
+        if self.hw_type == "microbit-v1":
+            latest = latest_v1
+        else:
+            latest = latest_v2
+
+        if not latest:
+            print("No latest version defined for this hardware type.")
+            return True
 
         try:
             if Version(device) >= Version(latest):
                 print(f"Interpreter up to date ({device} >= {latest})")
                 self._devlog("Interpreter already up to date")
                 return True
-        except:
+        except Exception as e:
             print("Version parse error; skipping update.")
-            self._devlog("Version parse error")
+            self._devlog(f"Version parse error: {e}")
             return True
 
         print(f"Outdated interpreter: device={device}, latest={latest}")
         print("Updating...")
         self._devlog("Starting update process")
 
+        # If devtype not known, use hardware type
         if not devtype:
-            devtype = self.detect_device_from_details()
-            if not devtype:
-                print("Cannot determine device type for flashing.")
-                return False
+            devtype = self.hw_type
 
         if not self.flash(devtype):
             return False
@@ -489,6 +584,11 @@ class Microbit:
 def main():
     m = Microbit(dev=True)
 
+    # Detect hardware type early and apply feature restrictions
+    hw = m.detect_device_from_details()
+    if hw:
+        m.apply_feature_restrictions(hw)
+
     print("Connecting...")
     if not m.connect():
         print("Could not connect via USB/BLE. Checking USB drive...")
@@ -498,6 +598,7 @@ def main():
             print("No micro:bit detected.")
             return
 
+        m.apply_feature_restrictions(devtype)
         print(f"Detected device by DETAILS.TXT: {devtype}")
         print("Flashing interpreter...")
 
