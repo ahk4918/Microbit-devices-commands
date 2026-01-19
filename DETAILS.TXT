@@ -1,4 +1,4 @@
-Firmware Version 2026.01.3
+Firmware Version 2026.01.1
 WORKS FOR Microbit V2 ONLY
 
 Description:

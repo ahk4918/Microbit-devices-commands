@@ -1,560 +1,525 @@
-import asyncio
-import os
-import sys
-import threading
-import signal
-import time
-import subprocess
-from typing import Optional
+#!/usr/bin/env python3
+import sys, time, threading, os, requests
+from packaging.version import Version
 
-import requests
-import serial
-import serial.tools.list_ports
-from bleak import BleakScanner, BleakClient
+DEFAULT_BAUD = 115200
 
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
+FIRMWARE_V1_URL = (
+    "https://raw.githubusercontent.com/"
+    "ahk4918/Microbit-devices-commands/main/firmware_v1.hex"
+)
 
-VERSION_URL = "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/DETAILS.TXT"
-INTERPRETER_URL = "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/microbit-interpreter.hex"
+FIRMWARE_V2_URL = (
+    "https://raw.githubusercontent.com/"
+    "ahk4918/Microbit-devices-commands/main/firmware_v2.hex"
+)
 
-UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # micro:bit -> PC
-RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # PC -> micro:bit
+DETAILS_URL = (
+    "https://raw.githubusercontent.com/"
+    "ahk4918/Microbit-devices-commands/main/DETAILS.TXT"
+)
 
-USB_KEYWORDS = [
-    "micro:bit",
-    "bbc",
-    "daplink",
-    "cmsis",
-    "mbed",
-    "serial",
-    "usb serial device",
-    "usb composite",
-]
-
-KNOWN_VIDS = {0x0D28}  # mbed / DAPLink VID
+BLE_DEVICE_NAME_PREFIX = "BBC micro:bit"
+BLE_UART_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+BLE_UART_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 
-# ---------------------------------------------------------
-# DRIVE DETECTION
-# ---------------------------------------------------------
-def find_microbit_drive():
-    try:
-        import win32api # type: ignore
-        import win32file# type: ignore
-    except ImportError:
-        print("⚠ pywin32 required for drive detection: pip install pywin32")
-        return None
-
-    drives = win32api.GetLogicalDriveStrings().split("\x00")
-
-    for d in drives:
-        if not d:
-            continue
-        try:
-            dtype = win32file.GetDriveType(d)
-            if dtype == win32file.DRIVE_REMOVABLE:
-                label = win32api.GetVolumeInformation(d)[0].lower()
-                if "microbit" in label or "mbed" in label or "daplink" in label:
-                    return d
-        except Exception:
-            pass
-
-    return None
-
-
-# ---------------------------------------------------------
-# NETWORK HELPERS
-# ---------------------------------------------------------
-def safe_download(url: str, attempts: int = 3, stream: bool = False):
-    for i in range(attempts):
-        try:
-            r = requests.get(url, timeout=10, stream=stream)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            print(f"Download attempt {i + 1} failed: {e}")
-            if i < attempts - 1:
-                time.sleep(1.2)
-    return None
-
-
-# ---------------------------------------------------------
-# VERSION CHECKING (REMOTE)
-# ---------------------------------------------------------
-def get_remote_interpreter_version() -> Optional[str]:
-    """
-    Remote version is taken from the first line of the GitHub DETAILS.TXT, e.g.:
-    'Firmware Version 2026.01.3'
-    We parse out '2026.01.3'.
-    """
-    r = safe_download(VERSION_URL, stream=False)
-    if not r:
-        return None
-
-    try:
-        first_line = r.text.splitlines()[0].strip().lstrip("\ufeff")
-        parts = first_line.split()
-        if not parts:
-            return None
-        # Assume version is the last token
-        return parts[-1]
-    except Exception:
-        return None
-# ---------------------------------------------------------
-# HEX VALIDATION
-# ---------------------------------------------------------
-def validate_hex_file(path: str) -> bool:
-    """
-    Validates that a HEX file is safe to flash to a micro:bit.
-    If validation fails:
-      - Saves the entire file to invalid_hex_dump.txt
-      - Prints the exact line number and content that failed
-    """
-    if not os.path.exists(path):
-        print("❌ HEX validation failed: file does not exist.")
-        return False
-
-    size = os.path.getsize(path)
-    if size < 1024:
-        print("❌ HEX validation failed: file too small.")
-        return False
-
-    has_ext_addr = False
-    eof_ok = False
-
-    # Read all lines first so we can dump them if needed
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-    except Exception as e:
-        print(f"❌ HEX validation failed: cannot read file: {e}")
-        return False
-
-    # Helper to dump file and show error line
-    def fail(reason: str, line_num: int = None, line: str = None):#type: ignore
-        dump_path = "invalid_hex_dump.txt"
-        with open(dump_path, "w", encoding="utf-8") as dump:
-            dump.writelines(lines)
-
-        print(f"\n❌ HEX validation failed: {reason}")
-        print(f"📄 Full file saved to: {dump_path}")
-
-        if line_num is not None:
-            print(f"🔍 Error at line {line_num}:")
-            print(f"    {line.rstrip()}")
-        return False
-
-    # Validate each line
-    for idx, raw_line in enumerate(lines, start=1):
-        line = raw_line.strip()
-
-        # Must start with ':'
-        if not line.startswith(":"):
-            return fail("line missing ':' prefix", idx, line)
-
-        # Check EOF record
-        if line.upper() == ":00000001FF":
-            eof_ok = True
-
-        # Check extended linear address record
-        if line.startswith(":02000004"):
-            has_ext_addr = True
-
-        # Basic Intel HEX format
-        try:
-            byte_count = int(line[1:3], 16)
-            address = int(line[3:7], 16)
-            record_type = int(line[7:9], 16)
-        except Exception:
-            return fail("malformed Intel HEX record", idx, line)
-
-        # Length check
-        expected_len = 11 + byte_count * 2
-        if len(line) != expected_len:
-            return fail(
-                f"incorrect line length (expected {expected_len}, got {len(line)})",
-                idx,
-                line,
-            )
-
-    if not eof_ok:
-        return fail("missing EOF record ':00000001FF'")
-
-    if not has_ext_addr:
-        return fail("missing extended linear address record ':02000004xxxxxx'")
-
-    print("✔ HEX file validated successfully.")
-    return True
-
-# ---------------------------------------------------------
-# FLASH INTERPRETER
-# ---------------------------------------------------------
-def flash_interpreter_direct() -> bool:
-    drive = find_microbit_drive()
-    if not drive:
-        print("❌ MICROBIT drive not found.")
-        return False
-
-    print("Downloading interpreter (non-streaming)...")
-    r = safe_download(INTERPRETER_URL, stream=False)
-    if not r:
-        print("❌ Could not download interpreter after retries.")
-        return False
-
-    temp_path = os.path.join(drive, "microbit-interpreter.tmp")
-    final_path = os.path.join(drive, "microbit-interpreter.hex")
-
-    print(f"Flashing interpreter to {final_path}...")
-
-    try:
-        # Write entire file in one chunk (prevents chunk corruption)
-        with open(temp_path, "wb") as f:
-            f.write(r.content)
-            f.flush()
-            os.fsync(f.fileno())
-
-        # Optional: hide temp file on Windows
-        try:
-            import ctypes
-            FILE_ATTRIBUTE_HIDDEN = 0x02
-            FILE_ATTRIBUTE_SYSTEM = 0x04
-            ctypes.windll.kernel32.SetFileAttributesW(
-                temp_path, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
-            )
-        except Exception:
-            pass
-
-        # Move into place atomically
-        os.replace(temp_path, final_path)
-
-        # Basic size check
-        size = os.path.getsize(final_path)
-        if size < 1024:
-            print("❌ Flash failed: resulting file too small.")
-            return False
-
-        # Validate HEX structure
-        if not validate_hex_file(final_path):
-            print("❌ Interpreter HEX failed validation. Aborting flash.")
-            return False
-
-        # Allow Windows to finish writing to USB
-        time.sleep(0.4)
-
-        print("Interpreter copied. Micro:bit will reboot and flash.")
-        return True
-
-    except Exception as e:
-        print(f"Flash failed: {e}")
-        return False
-
-# ---------------------------------------------------------
-# SAFE RESTART
-# ---------------------------------------------------------
-def restart_script():
-    print("Restarting controller...")
-    script = os.path.abspath(__file__)
-    subprocess.Popen([sys.executable, script])
-    sys.exit(0)
-
-
-# ---------------------------------------------------------
-# MICROBIT CONTROLLER
-# ---------------------------------------------------------
 class Microbit:
-    def __init__(self, mode: str = "BOTH", dev_mode: bool = False, version_check: bool = True):
-        self.dev_mode = dev_mode
-        self.version_check = version_check
-        self.mode = mode.upper()
-        self.current_mode: Optional[str] = None
+    def __init__(self, baudrate=115200, allow_update=True, dev=False):
+        self.mode = None
+        self.usb_ser = None
+        self.baudrate = baudrate
+        self.allow_update = allow_update
+        self.dev = dev
 
-        self.ser: Optional[serial.Serial] = None
-        self.ble_client: Optional[BleakClient] = None
-        self.active_rx = RX_UUID
+        self.ble_client = None
+        self.ble_rx_buffer = []
+        self.ble_lock = threading.Lock()
 
-        self._serial_lock = threading.Lock()
+        import asyncio
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
 
-        # Version query synchronization
-        self._waiting_for_version = False
-        self._version_event = threading.Event()
-        self._version_value: Optional[str] = None
+    # ---------- DEV LOG ----------
+    def _devlog(self, msg):
+        if self.dev:
+            print(f"[DEV] {msg}")
 
-        print(f"--- micro:bit Interpreter Controller (Mode: {self.mode}) ---")
-
-        # Start async event loop in background thread
-        self.loop = asyncio.new_event_loop()
-        threading.Thread(target=self._run_loop, daemon=True).start()
-
-        # Connect first (we need a connection to query installed version)
-        self.reconnect()
-
-        # Perform version check after connection
-        if self.version_check and self.current_mode is not None:
-            self.perform_interpreter_update()
-
-    # ---------------------------
-    # LOGGING
-    # ---------------------------
-    def log(self, msg: str):
-        if self.dev_mode:
-            print(f"[DEBUG] {msg}")
-
-    # ---------------------------
-    # ASYNC LOOP
-    # ---------------------------
+    # ---------- EVENT LOOP ----------
     def _run_loop(self):
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
+        import asyncio
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
 
-    # ---------------------------
-    # CONNECTION
-    # ---------------------------
-    def reconnect(self):
-        print("\nScanning for micro:bit devices...")
+    # ---------- USB ----------
+    def connect_usb(self):
+        import serial, serial.tools.list_ports
 
-        # USB first
-        if self.mode in ["BOTH", "SERIAL"]:
-            if self._try_connect_serial():
-                return
+        self._devlog("Scanning USB ports...")
 
-        # BLE next
-        if self.mode in ["BOTH", "BLE"]:
-            future = asyncio.run_coroutine_threadsafe(self._connect_ble(), self.loop)
-            try:
-                if future.result(timeout=35):
-                    self.current_mode = "BLE"
-                    print("Connected via Bluetooth.")
-                    return
-            except Exception as e:
-                self.log(f"BLE connection error: {e}")
-
-        print("Connection failed.")
-        self.current_mode = None
-
-    def _try_connect_serial(self) -> bool:
         for p in serial.tools.list_ports.comports():
-            desc = (p.description or "").lower()
-            vid = getattr(p, "vid", None)
+            port = p.device
+            self._devlog(f"Trying USB port {port}")
 
-            matches_keyword = any(k in desc for k in USB_KEYWORDS)
-            matches_vid = vid in KNOWN_VIDS if vid is not None else False
-
-            if not (matches_keyword or matches_vid):
+            try:
+                ser = serial.Serial(port, DEFAULT_BAUD, timeout=0.2)
+            except Exception as e:
+                self._devlog(f"Failed to open {port}: {e}")
                 continue
 
             try:
-                self.ser = serial.Serial(p.device, 115200, timeout=1)
-                self.current_mode = "SERIAL"
-                self._start_serial_listener()
-                print(f"Connected via USB ({p.device})")
-                return True
-            except Exception as e:
-                self.log(f"Failed to open serial port {p.device}: {e}")
+                ser.write(b"ping\n")
+                time.sleep(0.1)
+                out = ser.read(64).decode(errors="ignore")
+                self._devlog(f"USB RX from {port}: {out!r}")
 
+                if "pong" in out.lower():
+                    self.usb_ser = ser
+                    self.mode = "usb"
+                    print(f"Connected via USB: {port}")
+                    self._devlog("USB handshake OK")
+                    return True
+                else:
+                    self._devlog("No pong on this port")
+            except Exception as e:
+                self._devlog(f"Error talking to {port}: {e}")
+
+            ser.close()
+
+        self._devlog("USB scan complete, no device found")
         return False
 
-    async def _connect_ble(self) -> bool:
-        print("Scanning for BLE devices...")
+    def _usb_write(self, line):
+        if self.usb_ser:
+            self._devlog(f"USB TX: {line}")
+            self.usb_ser.write((line + "\n").encode())
+
+    def _usb_read(self):
+        if not self.usb_ser:
+            return ""
+        out = []
         try:
-            devices = await BleakScanner.discover(timeout=10.0)
-        except Exception as e:
-            print(f"BLE scan failed: {e}")
-            return False
-
-        candidates = [d for d in devices if "micro" in (d.name or "").lower()]
-
-        if not candidates:
-            print("No BLE micro:bit found.")
-            return False
-
-        target = candidates[0]
-        print(f"Connecting to {target.name} [{target.address}]")
-
-        self.ble_client = BleakClient(target)
-
-        try:
-            await self.ble_client.connect()
-        except Exception as e:
-            print(f"BLE connection failed: {e}")
-            return False
-
-        try:
-            await self.ble_client.start_notify(TX_UUID, self._on_data_received)
-            self.active_rx = RX_UUID
-            print("BLE notifications on TX_UUID, writing to RX_UUID.")
-            return True
-        except Exception:
-            self.log("TX notify failed, trying RX...")
-
-        try:
-            await self.ble_client.start_notify(RX_UUID, self._on_data_received)
-            self.active_rx = TX_UUID
-            print("BLE notifications on RX_UUID, writing to TX_UUID.")
-            return True
-        except Exception as e:
-            print(f"BLE notify setup failed: {e}")
-            try:
-                if self.ble_client and self.ble_client.is_connected:
-                    await self.ble_client.disconnect()
-            except Exception:
-                pass
-            self.ble_client = None
-            return False
-
-    # ---------------------------
-    # DATA HANDLING
-    # ---------------------------
-    def _on_data_received(self, handle, data):
-        if isinstance(data, (bytes, bytearray)):
-            msg = data.decode(errors="ignore").strip()
-        else:
-            msg = str(data).strip()
-
-        if not msg:
-            return
-
-        # If we are currently waiting for a version response, capture this message
-        if self._waiting_for_version and self._version_value is None:
-            self._version_value = msg
-            self._waiting_for_version = False
-            self._version_event.set()
-            self.log(f"Captured version response: {msg}")
-            return
-
-        print(f"\n[MICROBIT]: {msg}\n> ", end="", flush=True)
-
-    def _start_serial_listener(self):
-        def listen():
             while True:
-                with self._serial_lock:
-                    if not self.ser or not self.ser.is_open:
-                        break
-                    try:
-                        line = self.ser.readline().decode(errors="ignore").strip()
-                    except Exception:
-                        break
+                chunk = self.usb_ser.read(1024)
+                if not chunk:
+                    break
+                out.append(chunk.decode(errors="ignore"))
+        except:
+            pass
+        text = "".join(out)
+        if text:
+            self._devlog(f"USB RX: {text!r}")
+        return text
 
-                if line:
-                    self._on_data_received(None, line)
+    # ---------- BLE ----------
+    async def _ble_notify(self, sender, data):
+        text = data.decode(errors="ignore")
+        self._devlog(f"BLE NOTIFY: {text!r}")
+        with self.ble_lock:
+            self.ble_rx_buffer.append(text)
 
-            print("\n[INFO] Serial disconnected. Reconnecting...")
-            self.ser = None
-            self.current_mode = None
-            self.reconnect()
+    async def _ble_try_device(self, d):
+        from bleak import BleakClient
+        import asyncio
 
-        threading.Thread(target=listen, daemon=True).start()
+        self._devlog(f"Attempting BLE connection to {d.address}")
 
-    # ---------------------------
-    # COMMANDS
-    # ---------------------------
-    def send(self, cmd: str):
-        msg = (cmd.strip() + "\n").encode()
+        client = BleakClient(d.address)
+        try:
+            await client.connect(timeout=10.0)
+            self._devlog("BLE connected")
+        except Exception as e:
+            self._devlog(f"BLE connect failed: {e}")
+            return False
 
-        if self.current_mode == "SERIAL" and self.ser:
-            try:
-                with self._serial_lock:
-                    self.ser.write(msg)
-            except Exception:
-                print("Serial write failed. Reconnecting...")
-                self.reconnect()
+        try:
+            await client.start_notify(BLE_UART_TX_UUID, self._ble_notify)
+            self._devlog("BLE notifications enabled")
+        except Exception as e:
+            self._devlog(f"BLE notify failed: {e}")
+            return False
 
-        elif self.current_mode == "BLE" and self.ble_client:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    self.ble_client.write_gatt_char(self.active_rx, msg, response=False),
-                    self.loop,
-                )
-            except Exception:
-                print("BLE write failed. Reconnecting...")
-                self.reconnect()
+        try:
+            await client.write_gatt_char(BLE_UART_RX_UUID, b"ping\n")
+            self._devlog("BLE TX: ping")
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            self._devlog(f"BLE write failed: {e}")
+            return False
 
-        else:
-            print("Not connected. Attempting to reconnect...")
-            self.reconnect()
+        with self.ble_lock:
+            text = "".join(self.ble_rx_buffer)
+            self.ble_rx_buffer.clear()
 
-    # ---------------------------
-    # VERSION QUERY (INSTALLED)
-    # ---------------------------
-    def get_installed_interpreter_version(self, timeout: float = 3.0) -> Optional[str]:
-        """
-        Ask the micro:bit for its interpreter version by sending 'version'
-        and waiting for the next message. Assumes the interpreter replies
-        with only the version string, e.g. '2026.01.3'.
-        """
-        if self.current_mode is None:
-            self.reconnect()
-            if self.current_mode is None:
-                print("⚠ Could not connect to micro:bit to read installed version.")
-                return None
+        self._devlog(f"BLE handshake RX: {text!r}")
 
-        # Prepare to capture the version response
-        self._version_event.clear()
-        self._version_value = None
-        self._waiting_for_version = True
+        if "pong" in text.lower():
+            self.ble_client = client
+            self.mode = "ble"
+            print(f"Connected via BLE: {d.address}")
+            self._devlog("BLE handshake OK")
+            return True
 
-        # Short delay to ensure interpreter is ready
-        time.sleep(0.3)
+        await client.disconnect()
+        self._devlog("BLE handshake failed, disconnected")
+        return False
 
-        # Send version command
-        self.send("version")
+    async def _ble_open_async(self):
+        from bleak import BleakScanner
+        self._devlog("Scanning BLE devices...")
 
-        # Wait for version response
-        if not self._version_event.wait(timeout=timeout):
-            print("⚠ Timed out waiting for version response from micro:bit.")
-            self._waiting_for_version = False
+        devices = await BleakScanner.discover(timeout=4.0)
+        self._devlog(f"BLE scan found {len(devices)} devices")
+
+        for d in devices:
+            self._devlog(f"BLE device: name={d.name} addr={d.address}")
+            if (d.name or "").startswith(BLE_DEVICE_NAME_PREFIX):
+                self._devlog("Candidate micro:bit found")
+                if await self._ble_try_device(d):
+                    return True
+
+        self._devlog("No BLE micro:bit found")
+        return False
+
+    def connect_ble(self):
+        import asyncio
+        fut = asyncio.run_coroutine_threadsafe(self._ble_open_async(), self._loop)
+        try:
+            return fut.result()
+        except Exception as e:
+            self._devlog(f"BLE connect error: {e}")
+            return False
+
+    def _ble_write(self, line):
+        import asyncio
+        if not self.ble_client:
+            return
+        self._devlog(f"BLE TX: {line}")
+        data = (line + "\n").encode()
+        fut = asyncio.run_coroutine_threadsafe(
+            self.ble_client.write_gatt_char(BLE_UART_RX_UUID, data),
+            self._loop
+        )
+        try:
+            fut.result()
+        except Exception as e:
+            self._devlog(f"BLE write error: {e}")
+
+    def _ble_read(self):
+        with self.ble_lock:
+            if not self.ble_rx_buffer:
+                return ""
+            text = "".join(self.ble_rx_buffer)
+            self.ble_rx_buffer.clear()
+            self._devlog(f"BLE RX: {text!r}")
+            return text
+
+    # ---------- Unified ----------
+    def connect(self):
+        print("Trying USB...")
+        if self.connect_usb():
+            return True
+
+        print("Trying BLE...")
+        return self.connect_ble()
+
+    def write(self, line):
+        if self.mode == "usb":
+            self._usb_write(line)
+        elif self.mode == "ble":
+            self._ble_write(line)
+
+    def read(self):
+        if self.mode == "usb":
+            return self._usb_read()
+        elif self.mode == "ble":
+            return self._ble_read()
+        return ""
+
+    # ---------- Version ----------
+    def get_latest_version(self):
+        self._devlog("Fetching latest version from server")
+        try:
+            r = requests.get(DETAILS_URL, timeout=10)
+            first = r.text.splitlines()[0]
+            for token in first.split():
+                if token[0].isdigit():
+                    self._devlog(f"Latest version = {token}")
+                    return token
+        except Exception as e:
+            self._devlog(f"Version fetch failed: {e}")
+            return None
+        return None
+
+    def get_device_version(self):
+        self._devlog("Requesting device version")
+        self.write("version")
+        time.sleep(0.2)
+        out = self.read()
+
+        version = None
+        dtype = None
+        devtype = None
+
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Version:"):
+                version = line.split(":", 1)[1].strip()
+            if line.startswith("Type:"):
+                dtype = line.split(":", 1)[1].strip()
+            if line.startswith("Device Type:"):
+                devtype = line.split(":", 1)[1].strip()
+
+        self._devlog(f"Device version={version}, type={dtype}, devtype={devtype}")
+        return version, dtype, devtype
+
+    # ---------- Drive + DETAILS.TXT ----------
+    def find_drive(self):
+        self._devlog("Searching for MICROBIT drive...")
+
+        if os.name == "nt":
+            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                d = f"{letter}:\\"
+                if os.path.exists(os.path.join(d, "DETAILS.TXT")):
+                    self._devlog(f"Found drive at {d}")
+                    return d
+            self._devlog("No drive found on Windows")
             return None
 
-        return self._version_value
+        for root in ["/media", "/mnt", "/Volumes"]:
+            if not os.path.isdir(root):
+                continue
+            for name in os.listdir(root):
+                p = os.path.join(root, name)
+                if os.path.exists(os.path.join(p, "DETAILS.TXT")):
+                    self._devlog(f"Found drive at {p}")
+                    return p
 
-    # ---------------------------
-    # UPDATE LOGIC
-    # ---------------------------
-    def perform_interpreter_update(self):
-        installed = self.get_installed_interpreter_version()
-        remote = get_remote_interpreter_version()
+        self._devlog("No drive found on Unix")
+        return None
 
-        print(f"\nInstalled interpreter: {installed}")
-        print(f"Available interpreter: {remote}")
+    def detect_device_from_details(self):
+        drive = self.find_drive()
+        if not drive:
+            self._devlog("detect_device_from_details: no drive")
+            return None
 
-        if not remote:
-            print("⚠ Could not check remote version.")
-            return
+        path = os.path.join(drive, "DETAILS.TXT")
+        self._devlog(f"Reading {path}")
 
-        if installed == remote:
-            print("Interpreter is up to date.")
-            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except Exception as e:
+            self._devlog(f"Failed to read DETAILS.TXT: {e}")
+            return None
 
-        print("Updating interpreter to latest version...")
-        if flash_interpreter_direct():
-            print("Update complete. Restarting controller...")
-            restart_script()
+        self._devlog("Scanning DETAILS.TXT for board id")
+
+        board_id = None
+        for line in text.splitlines():
+            line = line.strip()
+            if "microbit.org/device" in line and "id=" in line:
+                try:
+                    after_id = line.split("id=", 1)[1]
+                    board_id = after_id.split("&", 1)[0]
+                    self._devlog(f"Parsed board id={board_id}")
+                except Exception as e:
+                    self._devlog(f"Failed to parse board id: {e}")
+                break
+
+        if not board_id:
+            self._devlog("No board id found in DETAILS.TXT")
+            return None
+
+        # Rule: V1 → 02xx, V2 → 99xx
+        if board_id.startswith("02"):
+            self._devlog("Detected micro:bit V1 from board id prefix 02xx")
+            return "microbit-v1"
+
+        if board_id.startswith("99"):
+            self._devlog("Detected micro:bit V2 from board id prefix 99xx")
+            return "microbit-v2"
+
+        if "microbit.org/device" in text:
+            self._devlog(f"Unknown board id {board_id}, defaulting to microbit-v2")
+            return "microbit-v2"
+
+        self._devlog("DETAILS.TXT did not look like a micro:bit")
+        return None
+
+    # ---------- Flash ----------
+    def flash(self, devtype):
+        drive = self.find_drive()
+        if not drive:
+            print("No MICROBIT drive found.")
+            self._devlog("flash: no drive found")
+            return False
+
+        self._devlog(f"Flashing device type {devtype}")
+
+        if devtype == "microbit-v1":
+            url = FIRMWARE_V1_URL
+        elif devtype == "microbit-v2":
+            url = FIRMWARE_V2_URL
         else:
-            print("Update failed. Keeping current interpreter.")
+            print("Unknown device type for flashing.")
+            self._devlog("flash: unknown device type")
+            return False
+
+        self._devlog(f"Downloading interpreter from {url}")
+
+        r = requests.get(url)
+        if r.status_code != 200:
+            print("Download failed.")
+            self._devlog(f"Download failed: HTTP {r.status_code}")
+            return False
+
+        path = os.path.join(drive, "microbit-interpreter.hex")
+        self._devlog(f"Writing HEX to {path}")
+
+        with open(path, "wb") as f:
+            f.write(r.content)
+
+        print("Flashed. Waiting for reboot...")
+        self._devlog("Flash complete")
+        time.sleep(3)
+        return True
+
+    # ---------- Update ----------
+    def ensure_updated(self):
+        latest = self.get_latest_version()
+        if not latest:
+            print("Could not fetch latest version.")
+            return True
+
+        device, dtype, devtype = self.get_device_version()
+
+        if not device:
+            print("Device did not respond to version. Checking USB drive...")
+            self._devlog("Device silent, using DETAILS.TXT fallback")
+            devtype = self.detect_device_from_details()
+            if not devtype:
+                print("No micro:bit detected.")
+                return False
+            print(f"Detected device by DETAILS.TXT: {devtype}")
+            device = "0.0.0"
+            dtype = "UNKNOWN"
+
+        try:
+            if Version(device) >= Version(latest):
+                print(f"Interpreter up to date ({device} >= {latest})")
+                self._devlog("Interpreter already up to date")
+                return True
+        except:
+            print("Version parse error; skipping update.")
+            self._devlog("Version parse error")
+            return True
+
+        print(f"Outdated interpreter: device={device}, latest={latest}")
+        print("Updating...")
+        self._devlog("Starting update process")
+
+        if not devtype:
+            devtype = self.detect_device_from_details()
+            if not devtype:
+                print("Cannot determine device type for flashing.")
+                return False
+
+        if not self.flash(devtype):
+            return False
+
+        print("Waiting for micro:bit to reboot...")
+        time.sleep(4)
+
+        print("Reconnecting...")
+        if not self.connect():
+            print("Reconnect failed after flashing.")
+            self._devlog("Reconnect failed")
+            return False
+
+        print("Re-checking version...")
+        device2, _, _ = self.get_device_version()
+        if not device2:
+            print("Device did not respond after update.")
+            self._devlog("Device silent after update")
+            return False
+
+        try:
+            if Version(device2) >= Version(latest):
+                print("Update successful.")
+                self._devlog("Update successful")
+                return True
+        except:
+            return True
+
+        print("Update failed: version did not change.")
+        self._devlog("Update failed: version unchanged")
+        return False
+
+    # ---------- Console ----------
+    def prepare_command(self, raw):
+        if not raw:
+            return None
+        normalized = " ".join(raw.strip().split())
+        if not normalized:
+            return None
+        return normalized
+
+    def console(self):
+        print("Connected. Type commands. Ctrl+C to exit.")
+        try:
+            while True:
+                raw = input("> ")
+                cmd = self.prepare_command(raw)
+                if not cmd:
+                    continue
+                self._devlog(f"TX: {cmd}")
+                self.write(cmd)
+                time.sleep(0.1)
+                out = self.read()
+                if out:
+                    self._devlog(f"RX: {out!r}")
+                    print(out, end="")
+        except KeyboardInterrupt:
+            print("\nBye.")
+
+
+def main():
+    m = Microbit(dev=True)
+
+    print("Connecting...")
+    if not m.connect():
+        print("Could not connect via USB/BLE. Checking USB drive...")
+
+        devtype = m.detect_device_from_details()
+        if not devtype:
+            print("No micro:bit detected.")
+            return
+
+        print(f"Detected device by DETAILS.TXT: {devtype}")
+        print("Flashing interpreter...")
+
+        if not m.flash(devtype):
+            print("Flash failed.")
+            return
+
+        print("Waiting for reboot...")
+        time.sleep(4)
+
+        print("Reconnecting...")
+        if not m.connect():
+            print("Reconnect failed after flashing.")
+            return
+
+    print("Checking interpreter version...")
+    if not m.ensure_updated():
+        print("Update failed.")
+        return
+
+    m.console()
+
 
 if __name__ == "__main__":
-    try:
-        controller = Microbit(mode="BOTH", dev_mode=True, version_check=False)
-
-        print("\nType commands to send to the micro:bit. Type 'exit' to quit.")
-        while True:
-            cmd = input("> ").strip()
-            if cmd.lower() in ["exit", "quit"]:
-                print("Exiting...")
-                break
-            if cmd:
-                controller.send(cmd)
-    except KeyboardInterrupt:
-        print("\nExiting...")
-    except Exception as e:
-        print(f"Fatal error: {e}")
-    finally:
-        try:
-            if controller.ble_client and controller.ble_client.is_connected:
-                asyncio.run_coroutine_threadsafe(
-                    controller.ble_client.disconnect(), controller.loop
-                )
-        except Exception:
-            pass
+    main()
