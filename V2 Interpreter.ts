@@ -3,7 +3,7 @@
 // USB + (optional) BLE UART
 // ===============================
 
-const FW_VERSION = "2026.01.4"
+const FW_VERSION = "2026.03.1"
 const FW_TYPE = "V2-STANDARD"
 const DEVICE_TYPE = "microbit-v2"
 

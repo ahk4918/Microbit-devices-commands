@@ -1,8 +1,8 @@
 # Micro:bit Interpreter Firmware Details
 # Unified version file for both V1 and V2 devices
 
-Firmware Version V1: 2026.01.1
-Firmware Version V2: 2026.01.4
+Firmware Version V1: 2026.03.1
+Firmware Version V2: 2026.03.1
 
 Description:
 This firmware package contains interpreters for both micro:bit V1 and V2.

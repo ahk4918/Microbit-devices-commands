@@ -5,11 +5,11 @@ from packaging.version import Version
 DEFAULT_BAUD = 115200
 
 FIRMWARE_V1_URL = (
-    "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/microbit-interpreterV1.hex"
+    "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/V1%20Interpreter.hex"
 )
 
 FIRMWARE_V2_URL = (
-    "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/microbit-interpreterV2.hex"
+    "https://raw.githubusercontent.com/ahk4918/Microbit-devices-commands/refs/heads/main/V2%20Interpreter.hex"
 )
 
 DETAILS_URL = (

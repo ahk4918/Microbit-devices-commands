@@ -1,4 +1,4 @@
-const FW_VERSION = "2026.01.4"
+const FW_VERSION = "2026.03.1"
 const FW_TYPE = "V1-MINIMAL"
 const DEVICE_TYPE = "microbit-v1"
 
