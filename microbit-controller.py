@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, time, threading, os, requests
+import sys, time, threading, os, requests, serial, serial.tools.list_ports
 from packaging.version import Version
 
 DEFAULT_BAUD = 115200
@@ -84,8 +84,6 @@ class Microbit:
 
     # ---------- USB ----------
     def connect_usb(self):
-        import serial, serial.tools.list_ports
-
         self._devlog("Scanning USB ports...")
 
         for p in serial.tools.list_ports.comports():
@@ -98,24 +96,36 @@ class Microbit:
                 self._devlog(f"Failed to open {port}: {e}")
                 continue
 
-            try:
-                ser.write(b"ping\n")
-                time.sleep(0.1)
-                out = ser.read(64).decode(errors="ignore")
-                self._devlog(f"USB RX from {port}: {out!r}")
+            # Retry handshake several times
+            got_pong = False
+            for attempt in range(5):
+                try:
+                    ser.write(b"ping\n")
+                    time.sleep(0.15)
+                    out = ser.read(64).decode(errors="ignore")
+                    self._devlog(f"USB RX attempt {attempt+1}: {out!r}")
 
-                if "pong" in out.lower():
-                    self.usb_ser = ser
-                    self.mode = "usb"
-                    print(f"Connected via USB: {port}")
-                    self._devlog("USB handshake OK")
-                    return True
-                else:
-                    self._devlog("No pong on this port")
-            except Exception as e:
-                self._devlog(f"Error talking to {port}: {e}")
+                    if "pong" in out.lower():
+                        got_pong = True
+                        break
 
-            ser.close()
+                except Exception as e:
+                    self._devlog(f"USB error on attempt {attempt+1}: {e}")
+
+                time.sleep(0.15)
+
+            if got_pong:
+                self.usb_ser = ser
+                self.mode = "usb"
+                print(f"Connected via USB: {port}")
+                self._devlog("USB handshake OK")
+                return True
+
+            # Silent device fallback
+            self._devlog(f"No pong on {port}, but port is alive — treating as silent device")
+            self.usb_ser = ser
+            self.mode = "usb"
+            return True
 
         self._devlog("USB scan complete, no device found")
         return False

@@ -134,6 +134,25 @@ function process_command(raw: string) {
         reply("Transport: usb")
         return
     }
+        // ----- Help -----
+    if (cmd == "help") {
+        reply("Commands:");
+        reply("  ping                - Check connection");
+        reply("  version             - Show firmware version");
+        reply("  status              - Show device status");
+        reply("  reset               - Reset pins + clear screen");
+        reply("  get_sensor <type>   - temp | light");
+        reply("  get_pin <pin>       - p0 p1 p2");
+        reply("  pin <d/a> <pin> <v> - Digital/analog write");
+        reply("  print <text>        - Scroll text");
+        reply("  plot x y            - LED on");
+        reply("  unplot x y          - LED off");
+        reply("  toggle x y          - LED toggle");
+        reply("  clear               - Clear LED matrix");
+        reply("  help                - Show this help");
+        return
+    }
+
 }
 
 // ---------- Serial handlers ----------
