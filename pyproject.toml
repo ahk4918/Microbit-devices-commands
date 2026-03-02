@@ -3,15 +3,25 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "Microbit Live"
+name = "microbit-live"
 version = "2026.03.1"
-description = "Use the microbit without flashing scripts!."
+description = "Use the micro:bit without flashing scripts!"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "GNU"}
+license = {text = "GPL-3.0-or-later"}
 authors = [
   {name = "Akhilesh"}
 ]
+
+dependencies = [
+  "requests",
+  "pyserial",
+  "packaging",
+  "bleak",
+]
+
+[project.scripts]
+microbit-live = "microbit_live.__main__:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
