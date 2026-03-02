@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Microbit Live"
+version = "2026.03.1"
+description = "Use the microbit without flashing scripts!."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "GNU"}
+authors = [
+  {name = "Akhilesh"}
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

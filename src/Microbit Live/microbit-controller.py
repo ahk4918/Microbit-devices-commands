@@ -592,7 +592,7 @@ class Microbit:
 
 
 def main():
-    m = Microbit(dev=True)
+    m = Microbit(dev=False)
 
     # Detect hardware type early and apply feature restrictions
     hw = m.detect_device_from_details()
